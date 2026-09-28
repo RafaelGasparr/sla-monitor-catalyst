@@ -11,6 +11,9 @@ logger = logging.getLogger()
 
 ZOHO_TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token"
 
+# In-memory cache for history stats (30 min TTL)
+_history_cache = {"agent": {}, "cat": {}, "expires": 0}
+
 
 def _desk_base():
     domain = os.environ.get("ZOHO_DESK_DOMAIN", "desk.zoho.com")
@@ -62,9 +65,7 @@ def _compute_metrics(violations):
     if not violations:
         return {"total": 0, "by_category": {}, "by_agent": {}, "by_priority": {}}
 
-    by_category = {}
-    by_agent = {}
-    by_priority = {}
+    by_category, by_agent, by_priority = {}, {}, {}
 
     for t in violations:
         cat = t.get("category") or "Unknown"
@@ -103,7 +104,7 @@ def _risk_score(ticket):
 
     now = datetime.now(timezone.utc)
     if due <= now:
-        return None  # já vencido — aparece na aba de violações
+        return None
 
     total_sla = (due - created).total_seconds()
     if total_sla <= 0:
@@ -113,6 +114,185 @@ def _risk_score(ticket):
     pct = (elapsed / total_sla) * 100
     return round(min(100.0, pct * weight), 1)
 
+
+# ── Data Store helpers ────────────────────────────────────────────────────────
+
+def _get_history_stats():
+    """Read AgentStats and CategoryStats from Catalyst Data Store (cached 30 min)."""
+    now = time.time()
+    if now < _history_cache["expires"]:
+        return _history_cache["agent"], _history_cache["cat"]
+
+    try:
+        app = zcatalyst_sdk.initialize()
+        agent_raw = app.datastore().table("AgentStats").get_paged_rows(max_rows=200)
+        cat_raw = app.datastore().table("CategoryStats").get_paged_rows(max_rows=200)
+
+        agent_rows = (agent_raw.get("data") if isinstance(agent_raw, dict) else agent_raw) or []
+        cat_rows = (cat_raw.get("data") if isinstance(cat_raw, dict) else cat_raw) or []
+
+        agent_stats = {}
+        for r in agent_rows:
+            key = (r.get("agent_name", ""), r.get("category", ""))
+            try:
+                agent_stats[key] = float(r.get("late_rate", 0))
+            except (ValueError, TypeError):
+                agent_stats[key] = 0.0
+
+        cat_stats = {}
+        for r in cat_rows:
+            try:
+                cat_stats[r.get("category", "")] = float(r.get("late_rate", 0))
+            except (ValueError, TypeError):
+                cat_stats[r.get("category", "")] = 0.0
+
+        _history_cache.update({"agent": agent_stats, "cat": cat_stats, "expires": now + 1800})
+        logger.info("Data Store: loaded %d agent stats, %d category stats", len(agent_stats), len(cat_stats))
+        return agent_stats, cat_stats
+
+    except Exception as exc:
+        logger.warning("Data Store read failed (using empty stats): %s", exc)
+        return {}, {}
+
+
+def _risk_score_with_history(ticket, agent_stats, cat_stats):
+    """Enhanced risk score using historical late rates from Data Store."""
+    base = _risk_score(ticket)
+    if base is None:
+        return None
+
+    category = (ticket.get("category") or "").strip()
+    assignee = ticket.get("assignee") or {}
+    agent = (assignee.get("firstName") or "") if assignee else ""
+
+    cat_rate = cat_stats.get(category, 0.0)
+    agent_rate = agent_stats.get((agent, category), agent_stats.get((agent, ""), 0.0))
+
+    # History boost: up to +25 points when late rate is 100%
+    boost = round((cat_rate * 0.4 + agent_rate * 0.6) * 25, 1)
+    return round(min(100.0, base + boost), 1)
+
+
+def _sync_history():
+    """Fetch closed Desk tickets, compute agent/category late rates, save to Data Store."""
+    headers = _desk_headers()
+    base = _desk_base()
+
+    resp = requests.get(
+        f"{base}/tickets",
+        headers=headers,
+        params={"limit": 50, "status": "Closed", "sortBy": "-closedTime"},
+    )
+    resp.raise_for_status()
+    ticket_list = resp.json().get("data", [])
+
+    agent_acc = {}  # {(agent, category): [total, late]}
+    cat_acc = {}    # {category: [total, late]}
+
+    for t in ticket_list:
+        detail = requests.get(f"{base}/tickets/{t['id']}", headers=headers)
+        if not detail.ok:
+            continue
+        full = detail.json()
+
+        category = (full.get("category") or "Unknown").strip()
+        assignee = full.get("assignee") or {}
+        agent = (assignee.get("firstName") or "Unassigned") if assignee else "Unassigned"
+
+        # Determine if ticket was resolved late
+        is_late = bool(full.get("isOverDue") or full.get("isResponseOverDue"))
+        if not is_late:
+            closed_str = full.get("closedTime")
+            due_str = full.get("dueDate")
+            if closed_str and due_str:
+                try:
+                    closed = datetime.fromisoformat(closed_str.replace("Z", "+00:00"))
+                    due = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
+                    is_late = closed > due
+                except Exception:
+                    pass
+
+        k = (agent, category)
+        if k not in agent_acc:
+            agent_acc[k] = [0, 0]
+        agent_acc[k][0] += 1
+        if is_late:
+            agent_acc[k][1] += 1
+
+        if category not in cat_acc:
+            cat_acc[category] = [0, 0]
+        cat_acc[category][0] += 1
+        if is_late:
+            cat_acc[category][1] += 1
+
+    # Write to Data Store
+    app = zcatalyst_sdk.initialize()
+    now_str = datetime.now(timezone.utc).isoformat()
+
+    def _upsert_table(table_name, rows_data, key_columns):
+        table = app.datastore().table(table_name)
+        try:
+            raw = table.get_paged_rows(max_rows=200)
+            existing = (raw.get("data") if isinstance(raw, dict) else raw) or []
+        except Exception:
+            existing = []
+
+        # Build index of existing rows by key
+        existing_index = {}
+        for row in existing:
+            key = tuple(str(row.get(c, "")) for c in key_columns)
+            existing_index[key] = str(row.get("ROWID", ""))
+
+        for row_data in rows_data:
+            key = tuple(str(row_data.get(c, "")) for c in key_columns)
+            if key in existing_index:
+                row_data["ROWID"] = existing_index[key]
+                try:
+                    table.update_row(row_data)
+                except Exception as e:
+                    logger.warning("Update failed, inserting instead: %s", e)
+                    table.insert_row({k: v for k, v in row_data.items() if k != "ROWID"})
+            else:
+                table.insert_row(row_data)
+
+    agent_rows = []
+    for (agent, category), (total, late) in agent_acc.items():
+        late_rate = round(late / total, 3) if total > 0 else 0.0
+        agent_rows.append({
+            "agent_name": agent,
+            "category": category,
+            "total_tickets": total,
+            "late_tickets": late,
+            "late_rate": late_rate,
+            "last_updated": now_str,
+        })
+
+    cat_rows = []
+    for category, (total, late) in cat_acc.items():
+        late_rate = round(late / total, 3) if total > 0 else 0.0
+        cat_rows.append({
+            "category": category,
+            "total_tickets": total,
+            "late_tickets": late,
+            "late_rate": late_rate,
+            "last_updated": now_str,
+        })
+
+    _upsert_table("AgentStats", agent_rows, ["agent_name", "category"])
+    _upsert_table("CategoryStats", cat_rows, ["category"])
+
+    # Invalidate cache
+    _history_cache["expires"] = 0
+
+    return {
+        "synced_tickets": len(ticket_list),
+        "agent_entries": len(agent_rows),
+        "category_entries": len(cat_rows),
+        "timestamp": now_str,
+    }
+
+
+# ── Risk predictor ────────────────────────────────────────────────────────────
 
 def _fetch_at_risk_tickets():
     headers = _desk_headers()
@@ -126,6 +306,9 @@ def _fetch_at_risk_tickets():
     resp.raise_for_status()
     ticket_list = resp.json().get("data", [])
 
+    agent_stats, cat_stats = _get_history_stats()
+    has_history = bool(agent_stats or cat_stats)
+
     at_risk = []
     for t in ticket_list:
         detail = requests.get(f"{base}/tickets/{t['id']}", headers=headers)
@@ -136,12 +319,13 @@ def _fetch_at_risk_tickets():
         if full.get("isOverDue") or full.get("isResponseOverDue"):
             continue
 
-        score = _risk_score(full)
+        score = _risk_score_with_history(full, agent_stats, cat_stats) if has_history else _risk_score(full)
         if score is None:
             continue
 
         full["_risk_score"] = score
         full["_risk_level"] = "alto" if score >= 75 else "medio" if score >= 45 else "baixo"
+        full["_history_boost"] = has_history
 
         due_str = full.get("dueDate")
         if due_str:
@@ -161,6 +345,8 @@ def _fetch_at_risk_tickets():
     at_risk.sort(key=lambda x: x["_risk_score"], reverse=True)
     return at_risk
 
+
+# ── AI analysis ───────────────────────────────────────────────────────────────
 
 def _analyze_with_ai(violations):
     summaries = [
@@ -206,6 +392,8 @@ def _analyze_with_ai(violations):
     resp.raise_for_status()
 
 
+# ── Handler ───────────────────────────────────────────────────────────────────
+
 CORS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -226,30 +414,6 @@ def handler(request: Request):
         if path in ("/", "/health"):
             return make_response(jsonify({"status": "ok"}), 200, CORS)
 
-        if path == "/debug/models" and method == "GET":
-            api_key = os.environ.get("GEMINI_API_KEY")
-            # Test generateContent with a minimal prompt to diagnose auth
-            test_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
-            test_payload = {"contents": [{"parts": [{"text": "say hi"}]}]}
-            r1 = requests.post(f"{test_url}?key={api_key}", json=test_payload)
-            r2 = requests.post(test_url, json=test_payload, headers={"x-goog-api-key": api_key})
-            return make_response(jsonify({
-                "key_prefix": api_key[:6] if api_key else None,
-                "with_query_param": {"status": r1.status_code, "body": r1.json()},
-                "with_header": {"status": r2.status_code, "body": r2.json()},
-            }), 200, CORS)
-
-        if path == "/debug/tickets" and method == "GET":
-            headers = _desk_headers()
-            resp = requests.get(
-                f"{_desk_base()}/tickets",
-                headers=headers,
-                params={"limit": 5, "sortBy": "-createdTime", "status": "open"},
-            )
-            tickets = resp.json().get("data", [])
-            # Return first ticket from list as-is (no simplification)
-            return make_response(jsonify(tickets[0] if tickets else {}), 200, CORS)
-
         if path == "/violations" and method == "GET":
             data = _fetch_violations()
             return make_response(jsonify({"data": data, "count": len(data)}), 200, CORS)
@@ -263,7 +427,35 @@ def handler(request: Request):
             counts = {"alto": 0, "medio": 0, "baixo": 0}
             for t in data:
                 counts[t.get("_risk_level", "baixo")] += 1
-            return make_response(jsonify({"data": data, "count": len(data), "by_risk": counts}), 200, CORS)
+            has_history = any(t.get("_history_boost") for t in data)
+            return make_response(jsonify({
+                "data": data,
+                "count": len(data),
+                "by_risk": counts,
+                "history_active": has_history,
+            }), 200, CORS)
+
+        if path == "/sync" and method == "POST":
+            result = _sync_history()
+            return make_response(jsonify(result), 200, CORS)
+
+        if path == "/debug/datastore" and method == "GET":
+            app = zcatalyst_sdk.initialize()
+            try:
+                table = app.datastore().table("AgentStats")
+                raw = table.get_paged_rows(max_rows=10)
+                return make_response(jsonify(raw if isinstance(raw, dict) else str(raw)), 200, CORS)
+            except Exception as e:
+                import traceback
+                return make_response(jsonify({"error": str(e), "trace": traceback.format_exc()}), 500, CORS)
+
+        if path == "/stats" and method == "GET":
+            agent_stats, cat_stats = _get_history_stats()
+            return make_response(jsonify({
+                "agent_stats": {f"{a}|{c}": r for (a, c), r in agent_stats.items()},
+                "cat_stats": cat_stats,
+                "cache_active": time.time() < _history_cache["expires"],
+            }), 200, CORS)
 
         if path == "/analyze" and method == "POST":
             body = request.get_json(silent=True) or {}
