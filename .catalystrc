@@ -1,0 +1,29 @@
+{
+  "defaults": {
+    "project": 1
+  },
+  "actives": {
+    "project": 1,
+    "env": 1
+  },
+  "projects": [
+    {
+      "idx": 1,
+      "id": "32455000000028001",
+      "name": "desk-sla-monitor",
+      "domain": {
+        "id": "10133370286",
+        "name": "desk-sla-monitor-891445019.development"
+      },
+      "timezone": "America/Sao_Paulo",
+      "env": [
+        {
+          "idx": 1,
+          "id": "891445019",
+          "name": "Development",
+          "type": 3
+        }
+      ]
+    }
+  ]
+}

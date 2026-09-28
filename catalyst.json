@@ -1,0 +1,12 @@
+{
+  "functions": {
+    "targets": [
+      "sla_monitor"
+    ],
+    "ignore": [],
+    "source": "functions"
+  },
+  "client": {
+    "source": "client"
+  }
+}

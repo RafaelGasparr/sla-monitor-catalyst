@@ -1,0 +1,14 @@
+# Credentials - never commit
+functions/sla_monitor/catalyst-config.json
+
+# Catalyst
+.catalyst/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Node
+node_modules/

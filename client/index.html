@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SLA Monitor – Zoho Desk</title>
+  <link rel="stylesheet" href="main.css" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>SLA Monitor</h1>
+      <span class="subtitle">Zoho Desk</span>
+    </div>
+    <button id="btn-refresh" class="btn-secondary">Atualizar</button>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="violations">Violações de SLA</button>
+    <button class="tab-btn" data-tab="predict">Preditor de Risco</button>
+  </nav>
+
+  <main>
+    <!-- TAB: Violações -->
+    <div id="tab-violations" class="tab-panel">
+      <!-- Metric cards -->
+      <section class="cards" id="cards">
+        <div class="card">
+          <span class="card-label">Total de Infrações</span>
+          <span class="card-value" id="metric-total">–</span>
+        </div>
+        <div class="card">
+          <span class="card-label">Categoria Crítica</span>
+          <span class="card-value" id="metric-top-category">–</span>
+        </div>
+        <div class="card">
+          <span class="card-label">Agente com Mais Atrasos</span>
+          <span class="card-value" id="metric-top-agent">–</span>
+        </div>
+        <div class="card">
+          <span class="card-label">Prioridade Predominante</span>
+          <span class="card-value" id="metric-top-priority">–</span>
+        </div>
+      </section>
+
+      <!-- Violations table -->
+      <section class="section">
+        <div class="section-header">
+          <h2>Tickets com SLA Violado</h2>
+          <span class="badge" id="badge-count">0</span>
+        </div>
+        <div class="table-wrapper">
+          <table id="violations-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Assunto</th>
+                <th>Categoria</th>
+                <th>Prioridade</th>
+                <th>Agente</th>
+                <th>Criado em</th>
+              </tr>
+            </thead>
+            <tbody id="violations-body">
+              <tr><td colspan="6" class="empty">Carregando…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- AI Analysis -->
+      <section class="section">
+        <div class="section-header">
+          <h2>Análise de Padrões (IA)</h2>
+          <button id="btn-analyze" class="btn-primary">Analisar com Claude</button>
+        </div>
+        <div id="insights-container" class="insights-grid hidden"></div>
+        <div id="insights-loading" class="loading-msg hidden">Analisando tickets…</div>
+        <div id="insights-empty" class="empty-msg">Clique em "Analisar com Claude" para identificar padrões nos tickets violados.</div>
+      </section>
+    </div>
+
+    <!-- TAB: Preditor de Risco -->
+    <div id="tab-predict" class="tab-panel hidden">
+      <!-- Risk summary cards -->
+      <section class="cards">
+        <div class="card card-danger">
+          <span class="card-label">Alto Risco</span>
+          <span class="card-value" id="risk-alto">–</span>
+        </div>
+        <div class="card card-warning">
+          <span class="card-label">Médio Risco</span>
+          <span class="card-value" id="risk-medio">–</span>
+        </div>
+        <div class="card card-success">
+          <span class="card-label">Baixo Risco</span>
+          <span class="card-value" id="risk-baixo">–</span>
+        </div>
+        <div class="card">
+          <span class="card-label">Total Analisado</span>
+          <span class="card-value" id="risk-total">–</span>
+        </div>
+      </section>
+
+      <!-- Predict table -->
+      <section class="section">
+        <div class="section-header">
+          <h2>Tickets em Risco de Violar o SLA</h2>
+          <span class="badge badge-warning" id="badge-risk">0</span>
+        </div>
+        <div class="table-wrapper">
+          <table id="predict-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Assunto</th>
+                <th>Prioridade</th>
+                <th>Agente</th>
+                <th>Tempo Restante</th>
+                <th>Score de Risco</th>
+              </tr>
+            </thead>
+            <tbody id="predict-body">
+              <tr><td colspan="6" class="empty">Selecione a aba para carregar.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="main.js"></script>
+</body>
+</html>
